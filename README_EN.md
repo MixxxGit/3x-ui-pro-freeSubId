@@ -103,7 +103,7 @@ The import link is printed by the script after installation.
 
 ---
 
-### Backup and restore
+## Backup and restore
 
 **Install the backup script**
 
