@@ -725,7 +725,6 @@ _panel_initial_config() {
 
 install_panel() {
     local tag_version
-	https://github.com/MixxxGit/
     local REPO_OWNER="MixxxGit"
     local REPO_NAME="3x-ui"
     local REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
