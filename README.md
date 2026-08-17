@@ -28,16 +28,10 @@
 
 ## Установка
 
-**Шаг 1 — скачать скрипт**
+**Однострочником**
 
 ```bash
-wget -qO x-ui-latest.sh https://raw.githubusercontent.com/MixxxGit/3x-ui-pro-freeSubId/main/x-ui-latest.sh
-```
-
-**Шаг 2 — запустить**
-
-```bash
-bash x-ui-latest.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/MixxxGit/3x-ui-pro-freeSubId/main/x-ui-latest.sh)
 ```
 
 ---
