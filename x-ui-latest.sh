@@ -725,34 +725,40 @@ _panel_initial_config() {
 
 install_panel() {
     local tag_version
+	https://github.com/MixxxGit/
+    local REPO_OWNER="MixxxGit"
+    local REPO_NAME="3x-ui"
+    local REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
+    local API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
+    
     apt-get update && apt-get install -y -q wget curl tar tzdata
 
     cd /usr/local/
 
     if [[ -n "$PANEL_VERSION" ]]; then
         tag_version="v${PANEL_VERSION#v}"
-        if ! curl -fsLo /dev/null "https://api.github.com/repos/MHSanaei/3x-ui/releases/tags/${tag_version}" \
-           && ! curl -4 -fsLo /dev/null "https://api.github.com/repos/MHSanaei/3x-ui/releases/tags/${tag_version}"; then
-            echo "3x-ui release ${tag_version} not found." && exit 1
+        if ! curl -fsLo /dev/null "${API_URL}/releases/tags/${tag_version}" \
+           && ! curl -4 -fsLo /dev/null "${API_URL}/releases/tags/${tag_version}"; then
+            echo "${REPO_NAME} release ${tag_version} not found." && exit 1
         fi
     else
-        tag_version=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" \
+        tag_version=$(curl -Ls "${API_URL}/releases/latest" \
             | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
         if [[ ! "$tag_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            tag_version=$(curl -4 -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" \
+            tag_version=$(curl -4 -Ls "${API_URL}/releases/latest" \
                 | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
         fi
         if [[ ! "$tag_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Failed to fetch 3x-ui version." && exit 1
+            echo "Failed to fetch ${REPO_NAME} version." && exit 1
         fi
     fi
 
-    echo "Installing 3x-ui ${tag_version} ..."
+    echo "Installing ${REPO_NAME} ${tag_version} ..."
     wget -N -O /usr/local/x-ui-linux-$(_arch).tar.gz \
-        "https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(_arch).tar.gz"
+        "${REPO_URL}/releases/download/${tag_version}/x-ui-linux-$(_arch).tar.gz"
     [[ $? -ne 0 ]] && echo "Download failed." && exit 1
 
-    wget -O /usr/bin/x-ui-temp https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh
+    wget -O /usr/bin/x-ui-temp "${REPO_URL}/raw/main/x-ui.sh"
     [[ $? -ne 0 ]] && echo "Failed to download x-ui.sh" && exit 1
 
     [[ -d /usr/local/x-ui/ ]] && systemctl stop x-ui 2>/dev/null; rm -rf /usr/local/x-ui/
@@ -779,7 +785,7 @@ install_panel() {
     systemctl enable x-ui
     systemctl start x-ui
 
-    msg_ok "3x-ui ${tag_version} installed."
+    msg_ok "${REPO_NAME} ${tag_version} installed."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
