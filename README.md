@@ -37,6 +37,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/MixxxGit/3x-ui-pro-freeSubId
 ---
 ## Патч
 
+Если панель уже установлена то можно попробовать этот патч.
 Применить текущие фиксы к существующей установке (без изменений БД):
 
 ```bash
