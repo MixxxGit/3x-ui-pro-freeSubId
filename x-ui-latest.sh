@@ -173,13 +173,13 @@ IP6_REGEX="([a-f0-9:]+:+)+[a-f0-9]+"
 get_server_ip() {
     IP4=$(ip route get 8.8.8.8 2>&1 | grep -Po -- 'src \K\S*')
     IP6=$(ip route get 2620:fe::fe 2>&1 | grep -Po -- 'src \K\S*')
-    [[ $IP4 =~ $IP4_REGEX ]] || IP4=$(curl -s ipv4.icanhazip.com | tr -d '[:space:]')
-    [[ $IP6 =~ $IP6_REGEX ]] || IP6=$(curl -s ipv6.icanhazip.com | tr -d '[:space:]')
+    [[ $IP4 =~ $IP4_REGEX ]] || IP4=$(curl -s --noproxy '*' ipv4.icanhazip.com | tr -d '[:space:]')
+    [[ $IP6 =~ $IP6_REGEX ]] || IP6=$(curl -s --noproxy '*' ipv6.icanhazip.com | tr -d '[:space:]')
 }
 
 # Early IP fetch for auto-domain
 IP4=$(ip route get 8.8.8.8 2>&1 | grep -Po -- 'src \K\S*')
-[[ $IP4 =~ $IP4_REGEX ]] || IP4=$(curl -s ipv4.icanhazip.com | tr -d '[:space:]')
+[[ $IP4 =~ $IP4_REGEX ]] || IP4=$(curl -s --noproxy '*' ipv4.icanhazip.com | tr -d '[:space:]')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,6 +249,11 @@ get_ssl_certs() {
         [[ $resolve_ok == false ]] && exit 1
     fi
 
+    # Отключаем прокси для certbot
+    local old_https_proxy="$https_proxy"
+    local old_http_proxy="$http_proxy"
+    unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ALL_PROXY all_proxy
+
     certbot certonly --standalone --non-interactive --agree-tos \
         --register-unsafely-without-email -d "$domain"
     if [[ ! -d "/etc/letsencrypt/live/${domain}/" ]]; then
@@ -263,6 +268,10 @@ get_ssl_certs() {
         msg_err "$reality_domain SSL could not be generated! Check Domain/IP." && exit 1
     fi
 
+    # Восстанавливаем прокси
+    export https_proxy="$old_https_proxy"
+    export http_proxy="$old_http_proxy"
+
     mkdir -p /root/cert/${domain}
     chmod 755 /root/cert/*
     ln -sf /etc/letsencrypt/live/${domain}/fullchain.pem /root/cert/${domain}/fullchain.pem
@@ -275,8 +284,6 @@ get_ssl_certs() {
 configure_nginx() {
     mkdir -p /etc/nginx/stream-enabled /etc/nginx/snippets
 
-    # nginx >= 1.25.1 deprecates "listen ... http2" in favor of "http2 on;";
-    # older versions (Debian 12 / Ubuntu 24.04) don't know the new directive
     local ngx_ver http2_listen="" http2_on=""
     ngx_ver=$(nginx -v 2>&1 | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' || echo 0)
     if [[ "$(printf '%s\n' 1.25.1 "$ngx_ver" | sort -V | head -1)" == "1.25.1" ]]; then
@@ -285,7 +292,6 @@ configure_nginx() {
         http2_listen=" http2"
     fi
 
-    # SNI-based stream: reality → 8443, domain → 7443
     cat > /etc/nginx/stream-enabled/stream.conf <<EOF
 map \$ssl_preread_server_name \$sni_name {
     hostnames;
@@ -315,7 +321,6 @@ EOF
         || echo "worker_rlimit_nofile 16384;" >> /etc/nginx/nginx.conf
     sed -i "/worker_connections/c\worker_connections 4096;" /etc/nginx/nginx.conf
 
-    # HTTP → HTTPS redirect
     cat > /etc/nginx/sites-available/80.conf <<EOF
 server {
     listen 80;
@@ -324,9 +329,7 @@ server {
 }
 EOF
 
-    # Shared proxy locations for xray inbounds (included by both vhosts)
     cat > /etc/nginx/snippets/includes.conf <<EOF
-    #Subscription — prefix location covers all sub-paths (assets, JS, etc.)
     location /${sub_path}/ {
         if (\$hack = 1) { return 404; }
         proxy_redirect off;
@@ -343,8 +346,6 @@ EOF
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_pass https://127.0.0.1:${sub_port};
     }
-    # Regex takes priority over prefix: catches subscription IDs (one-level deep)
-    # and routes Clash/Mihomo clients to dynamic clash.yaml generator
     location ~ ^/${sub_path}/(?<clash_sub_id>[^/]+)$ {
         if (\$hack = 1) { return 404; }
         if (\$serve_clash_yaml = 1) { rewrite ^ /__clash_api?sub_id=\$clash_sub_id last; }
@@ -357,7 +358,6 @@ EOF
     location /assets  { proxy_pass https://127.0.0.1:${sub_port}; }
     location /assets/ { proxy_pass https://127.0.0.1:${sub_port}; }
 
-    #Subscription (json)
     location /${json_path} {
         if (\$hack = 1) { return 404; }
         proxy_redirect off;
@@ -375,7 +375,6 @@ EOF
         proxy_pass https://127.0.0.1:${sub_port};
     }
 
-    #XHTTP
     location /${xhttp_path} {
         grpc_pass grpc://unix:/dev/shm/uds2023.sock;
         grpc_buffer_size      16k;
@@ -390,7 +389,6 @@ EOF
         grpc_set_header X-Forwarded-Host  \$host;
     }
 
-    #Xray generic proxy (WS / gRPC by port+path)
     location ~ ^/(?<fwdport>\d+)/(?<fwdpath>.*)\$ {
         if (\$hack = 1) { return 404; }
         client_max_body_size 0;
@@ -424,32 +422,22 @@ EOF
     location / { try_files \$uri \$uri/ =404; }
 EOF
 
-    # HTTP-level maps. The clash maps are consumed by the shared includes.conf
-    # snippet, which is included by BOTH vhosts, so they live in their own
-    # always-loaded file — never inside a single vhost, or the other vhost's
-    # include would reference an undefined var ("unknown ... variable").
     cat > /etc/nginx/sites-available/00-maps.conf <<EOF
-# Detect Clash/Mihomo clients by User-Agent
 map \$http_user_agent \$is_clash_ua {
     ~*(clash|clashx|clashn|mihomo|stash|surfboard)  1;
     default                                          0;
 }
-# Serve clash.yaml only when: Clash UA AND no ?provider=1 query param
-# (proxy-provider refresh requests add ?provider=1 and must get the real sub)
 map "\$is_clash_ua:\$arg_provider" \$serve_clash_yaml {
     "1:"    1;
     default 0;
 }
 EOF
 
-    # Main domain vhost (TLS termination at 7443, proxy_protocol)
     cat > "/etc/nginx/sites-available/${domain}" <<EOF
-# Rate limiting zones (http context)
 limit_req_zone  \$binary_remote_addr zone=diag_api:10m  rate=6r/m;
 limit_req_zone  \$binary_remote_addr zone=diag_page:10m rate=30r/m;
 limit_conn_zone \$binary_remote_addr zone=per_ip:10m;
 
-# Diagnostics access: cookie issued by the SSO bridge after panel login
 map \$cookie_diag_key \$diag_auth {
     "${diag_token}" 1;
     default          0;
@@ -465,11 +453,7 @@ server {
     root /var/www/html/;
     real_ip_header proxy_protocol;
     set_real_ip_from 127.0.0.1;
-    # This vhost listens on 7443 behind the SNI stream (public port 443). Without
-    # this, nginx bakes :7443 into redirect Location headers (return/error_page),
-    # so browsers get sent to an unreachable port. Keep redirects relative.
     absolute_redirect off;
-    # Larger h2 preread window improves single-stream upload throughput
     http2_body_preread_size 128k;
     client_body_buffer_size 512k;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -509,16 +493,8 @@ server {
         proxy_pass https://127.0.0.1:${panel_port};
     }
 
-    # ── Diagnostics SSO bridge ───────────────────────────────────────────────
-    # Lives under the panel path so the browser attaches the 3x-ui session
-    # cookie (its Path is scoped to the panel base path). Valid panel session
-    # → issue the diag cookie and redirect; otherwise → panel login page.
-    # NOTE: auth_request runs in the access phase; a plain "return" here would
-    # skip it (rewrite phase), hence the try_files → named-location hop.
     location = /${panel_path}/diag {
         auth_request /__diag_auth;
-        # Named location (not "=302 /uri") so the deny path emits a real Location
-        # header; an internal-redirect error_page returns a 302 with no Location.
         error_page 401 403 = @diag_login;
         try_files /__nonexistent @diag_sso_ok;
     }
@@ -534,26 +510,14 @@ server {
         proxy_pass https://127.0.0.1:${panel_port}/${panel_path}/panel/;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        # 3x-ui answers AJAX requests with 401 instead of a login redirect
         proxy_set_header X-Requested-With XMLHttpRequest;
         proxy_pass_request_body off;
         proxy_set_header Content-Length "";
-        # auth_request emits a raw 500 to the browser if the subrequest returns
-        # anything other than 2xx / 401 / 403 (a login 302, or a 502 when the
-        # panel's HTTPS cert is missing). Coerce every such status to a 401 deny
-        # so the main location redirects to the panel login instead of 500ing.
-        # 401/403 must be listed too, else the server-level "error_page 401 =404"
-        # hijacks a genuine deny into a 404 (which auth_request then 500s on).
         proxy_intercept_errors on;
         error_page 300 301 302 303 304 305 307 308 400 401 402 403 404 405 500 501 502 503 504 =401 @diag_denied;
     }
     location @diag_denied { return 401; }
 
-    # ── Network diagnostics page ─────────────────────────────────────────────
-    # No diag cookie yet → bounce through the SSO bridge, which checks the panel
-    # session and mints the cookie, so a bookmarked diag link "just works" once
-    # you're logged into the panel. (Only the HTML page redirects; the API/asset
-    # sub-locations below stay 404 without the cookie.)
     location ^~ ${diag_path} {
         if (\$diag_auth = 0) { return 302 /${panel_path}/diag; }
         limit_req  zone=diag_page burst=10 nodelay;
@@ -566,7 +530,6 @@ server {
         add_header X-Robots-Tag "noindex, nofollow" always;
     }
 
-    # ── Diagnostics MTR API ──────────────────────────────────────────────────
     location ^~ ${diag_path}api/mtr {
         if (\$diag_auth = 0) { return 404; }
         limit_req  zone=diag_api burst=2 nodelay;
@@ -577,15 +540,9 @@ server {
         proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_read_timeout 120s;
         proxy_send_timeout 120s;
-        # Let the backend's JSON error bodies through; the server-level
-        # "proxy_intercept_errors on" would otherwise rewrite a 500 into an HTML
-        # 404 and break the frontend's response.json() parse.
         proxy_intercept_errors off;
     }
 
-    # ── LibreSpeed upload sink ───────────────────────────────────────────────
-    # No limit_req: librespeed fires many short POSTs (parallel streams).
-    # proxy_request_buffering off = client sees true network backpressure.
     location ^~ ${diag_path}api/st/up {
         if (\$diag_auth = 0) { return 404; }
         access_log              off;
@@ -600,7 +557,6 @@ server {
         add_header              Cache-Control "no-store" always;
     }
 
-    # ── LibreSpeed ping endpoint (answered by nginx, no backend hop) ─────────
     location = ${diag_path}api/st/ping {
         if (\$diag_auth = 0) { return 404; }
         access_log off;
@@ -610,7 +566,6 @@ server {
         return 200 "";
     }
 
-    # ── LibreSpeed client IP ─────────────────────────────────────────────────
     location = ${diag_path}api/st/getip {
         if (\$diag_auth = 0) { return 404; }
         proxy_pass          http://127.0.0.1:${mtr_backend_port}/api/st/getip;
@@ -619,7 +574,6 @@ server {
         add_header          Cache-Control "no-store" always;
     }
 
-    # ── Download test files ──────────────────────────────────────────────────
     location ^~ ${diag_path}testfiles/ {
         if (\$diag_auth = 0) { return 404; }
         alias      /var/www/diagnostics/testfiles/;
@@ -628,7 +582,6 @@ server {
         add_header Content-Disposition "attachment" always;
     }
 
-    # ── Clash YAML generator — internal, proxied here by rewrite from sub_path ────
     location = /__clash_api {
         internal;
         proxy_pass          http://127.0.0.1:${mtr_backend_port}/api/clash\$is_args\$args;
@@ -643,7 +596,6 @@ server {
 }
 EOF
 
-    # Reality domain vhost (plain TLS at 9443, no proxy_protocol)
     cat > "/etc/nginx/sites-available/${reality_domain}" <<EOF
 server {
     server_tokens off;
@@ -684,7 +636,6 @@ server {
 }
 EOF
 
-    # Activate configs
     if [[ -f "/etc/nginx/sites-available/${domain}" ]]; then
         rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
         ln -sf "/etc/nginx/sites-available/00-maps.conf"       /etc/nginx/sites-enabled/
@@ -727,532 +678,24 @@ install_panel() {
     local tag_version
     local REPO_OWNER="MixxxGit"
     local REPO_NAME="3x-ui"
-
     local REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
-    local API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
-    
+    local arch=$(_arch)
+
     apt-get update && apt-get install -y -q wget curl tar tzdata
 
     cd /usr/local/
 
+    # Определяем версию
     if [[ -n "$PANEL_VERSION" ]]; then
         tag_version="v${PANEL_VERSION#v}"
-        if ! curl -fsLo /dev/null "${API_URL}/releases/tags/${tag_version}" \
-           && ! curl -4 -fsLo /dev/null "${API_URL}/releases/tags/${tag_version}"; then
-            echo "${REPO_NAME} release ${tag_version} not found." && exit 1
-        fi
     else
-        tag_version=$(curl -Ls "${API_URL}/releases/latest" \
-            | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
-        if [[ ! "$tag_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            tag_version=$(curl -4 -Ls "${API_URL}/releases/latest" \
-                | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
-        fi
-        if [[ ! "$tag_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Failed to fetch ${REPO_NAME} version." && exit 1
+        # Пробуем получить через API (с прокси если есть)
+        tag_version=$(curl -sL --max-time 15 "${REPO_URL}/releases" 2>/dev/null \
+            | grep -oP '(?<=/releases/tag/)[^"]+' | head -1)
+        if [[ -z "$tag_version" ]]; then
+            echo "Failed to fetch ${REPO_NAME} version. Use -version parameter."
+            exit 1
         fi
     fi
 
-    echo "Installing ${REPO_NAME} ${tag_version} ..."
-    wget -N -O /usr/local/x-ui-linux-$(_arch).tar.gz \
-        "${REPO_URL}/releases/download/${tag_version}/x-ui-linux-$(_arch).tar.gz"
-    [[ $? -ne 0 ]] && echo "Download failed." && exit 1
-
-    wget -O /usr/bin/x-ui-temp "${REPO_URL}/raw/main/x-ui.sh"
-    [[ $? -ne 0 ]] && echo "Failed to download x-ui.sh" && exit 1
-
-    [[ -d /usr/local/x-ui/ ]] && systemctl stop x-ui 2>/dev/null; rm -rf /usr/local/x-ui/
-
-    tar zxvf x-ui-linux-$(_arch).tar.gz
-    rm -f x-ui-linux-$(_arch).tar.gz
-
-    cd x-ui
-    chmod +x x-ui x-ui.sh
-
-    if [[ $(_arch) == "armv5" || $(_arch) == "armv6" || $(_arch) == "armv7" ]]; then
-        mv bin/xray-linux-$(_arch) bin/xray-linux-arm
-        chmod +x bin/xray-linux-arm
-    fi
-    chmod +x bin/xray-linux-$(_arch)
-
-    mv -f /usr/bin/x-ui-temp /usr/bin/x-ui
-    chmod +x /usr/bin/x-ui
-
-    _panel_initial_config
-
-    cp -f x-ui.service.debian /etc/systemd/system/x-ui.service
-    systemctl daemon-reload
-    systemctl enable x-ui
-    systemctl start x-ui
-
-    msg_ok "${REPO_NAME} ${tag_version} installed."
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURE X-UI DATABASE
-# ─────────────────────────────────────────────────────────────────────────────
-configure_xui_db() {
-    if [[ ! -f $XUIDB ]]; then
-        msg_err "x-ui.db not found — panel may not be installed." && exit 1
-    fi
-
-    x-ui stop 2>/dev/null || true
-
-    local output private_key public_key trojan_pass emoji_flag xray_bin
-    # install_panel renames armv5/6/7 binaries to xray-linux-arm
-    xray_bin="/usr/local/x-ui/bin/xray-linux-$(_arch)"
-    [[ -f "$xray_bin" ]] || xray_bin="/usr/local/x-ui/bin/xray-linux-arm"
-    output=$("$xray_bin" x25519)
-    private_key=$(echo "$output" | grep "^PrivateKey:" | awk '{print $2}')
-    public_key=$(echo "$output"  | grep "^Password"   | awk '{print $3}')
-    trojan_pass=$(gen_random_string 10)
-    # Per-host group_id: without it the panel cannot edit or delete the host.
-    # The column only exists since 3x-ui v3.5.0 (pinnable via -version), so
-    # probe the migrated schema and skip it on older releases.
-    local gid_col="" gid_reality="" gid_ws="" gid_xhttp="" gid_trojan=""
-    if sqlite3 "$XUIDB" "PRAGMA table_info(hosts);" | grep -qw "group_id"; then
-        gid_col='"group_id",'
-        gid_reality="'$(gen_group_id)',"
-        gid_ws="'$(gen_group_id)',"
-        gid_xhttp="'$(gen_group_id)',"
-        gid_trojan="'$(gen_group_id)',"
-    fi
-    emoji_flag=$(LC_ALL=en_US.UTF-8 curl -s --max-time 10 https://ipwho.is/ | jq -r '.flag.emoji' 2>/dev/null)
-    [[ -z "$emoji_flag" || "$emoji_flag" == "null" ]] && emoji_flag="🌐"
-
-    local sub_uri="https://${domain}/${sub_path}/"
-    local json_uri="https://${domain}/${json_path}?name="
-
-    # Prepare short IDs for REALITY
-    local shor
-    shor=($(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) \
-           $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8))
-
-    sqlite3 $XUIDB <<EOF
-DELETE FROM "settings" WHERE "key" IN ("webCertFile","webKeyFile");
-
-INSERT INTO "settings" ("key","value") VALUES ("subPort",             '${sub_port}');
-INSERT INTO "settings" ("key","value") VALUES ("subPath",             '/${sub_path}/');
-INSERT INTO "settings" ("key","value") VALUES ("subURI",              '${sub_uri}');
-INSERT INTO "settings" ("key","value") VALUES ("subJsonPath",         '/${json_path}');
-INSERT INTO "settings" ("key","value") VALUES ("subJsonURI",          '${json_uri}');
-INSERT INTO "settings" ("key","value") VALUES ("subClashEnable",      'false');
-INSERT INTO "settings" ("key","value") VALUES ("subEnableRouting",    'false');
-INSERT INTO "settings" ("key","value") VALUES ("subEnable",           'true');
-INSERT INTO "settings" ("key","value") VALUES ("webListen",           '');
-INSERT INTO "settings" ("key","value") VALUES ("webDomain",           '');
-INSERT INTO "settings" ("key","value") VALUES ("webCertFile",         '');
-INSERT INTO "settings" ("key","value") VALUES ("webKeyFile",          '');
-INSERT INTO "settings" ("key","value") VALUES ("sessionMaxAge",       '60');
-INSERT INTO "settings" ("key","value") VALUES ("pageSize",            '50');
-INSERT INTO "settings" ("key","value") VALUES ("expireDiff",          '0');
-INSERT INTO "settings" ("key","value") VALUES ("trafficDiff",         '0');
-INSERT INTO "settings" ("key","value") VALUES ("remarkModel",         '-ieo');
-INSERT INTO "settings" ("key","value") VALUES ("tgBotEnable",         'false');
-INSERT INTO "settings" ("key","value") VALUES ("tgBotToken",          '');
-INSERT INTO "settings" ("key","value") VALUES ("tgBotProxy",          '');
-INSERT INTO "settings" ("key","value") VALUES ("tgBotAPIServer",      '');
-INSERT INTO "settings" ("key","value") VALUES ("tgBotChatId",         '');
-INSERT INTO "settings" ("key","value") VALUES ("tgRunTime",           '@daily');
-INSERT INTO "settings" ("key","value") VALUES ("tgBotBackup",         'false');
-INSERT INTO "settings" ("key","value") VALUES ("tgBotLoginNotify",    'true');
-INSERT INTO "settings" ("key","value") VALUES ("tgCpu",               '80');
-INSERT INTO "settings" ("key","value") VALUES ("tgLang",              'en-US');
-INSERT INTO "settings" ("key","value") VALUES ("timeLocation",        'Europe/Moscow');
-INSERT INTO "settings" ("key","value") VALUES ("secretEnable",        'false');
-INSERT INTO "settings" ("key","value") VALUES ("subDomain",           '');
-INSERT INTO "settings" ("key","value") VALUES ("subCertFile",         '');
-INSERT INTO "settings" ("key","value") VALUES ("subKeyFile",          '');
-INSERT INTO "settings" ("key","value") VALUES ("subUpdates",          '12');
-INSERT INTO "settings" ("key","value") VALUES ("subEncrypt",          'true');
-INSERT INTO "settings" ("key","value") VALUES ("subShowInfo",         'true');
-INSERT INTO "settings" ("key","value") VALUES ("subJsonFragment",     '');
-INSERT INTO "settings" ("key","value") VALUES ("subJsonNoises",       '');
-INSERT INTO "settings" ("key","value") VALUES ("subJsonMux",          '');
-INSERT INTO "settings" ("key","value") VALUES ("subJsonRules",        '');
-INSERT INTO "settings" ("key","value") VALUES ("datepicker",          'gregorian');
-
-INSERT INTO "inbounds"
-    ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing")
-VALUES (
-    '1','0','0','0','${emoji_flag} reality','1','0','','8443','vless',
-    '{
-  "clients": [],
-  "decryption": "none",
-  "fallbacks": []
-}',
-    '{
-  "network": "tcp",
-  "security": "reality",
-  "realitySettings": {
-    "show": false,
-    "xver": 0,
-    "target": "127.0.0.1:9443",
-    "serverNames": ["${reality_domain}"],
-    "privateKey": "${private_key}",
-    "minClient": "",
-    "maxClient": "",
-    "maxTimediff": 0,
-    "shortIds": [
-      "${shor[0]}","${shor[1]}","${shor[2]}","${shor[3]}",
-      "${shor[4]}","${shor[5]}","${shor[6]}","${shor[7]}"
-    ],
-    "settings": {
-      "publicKey": "${public_key}",
-      "fingerprint": "firefox",
-      "serverName": "",
-      "spiderX": "/"
-    }
-  },
-  "tcpSettings": {
-    "acceptProxyProtocol": true,
-    "header": {"type":"none"}
-  }
-}',
-    'inbound-8443',
-    '{"enabled":false,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
-);
-
-INSERT INTO "inbounds"
-    ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing")
-VALUES (
-    '1','0','0','0','${emoji_flag} ws','1','0','','${ws_port}','vless',
-    '{
-  "clients": [],
-  "decryption": "none",
-  "fallbacks": []
-}',
-    '{
-  "network": "ws",
-  "security": "none",
-  "wsSettings": {
-    "acceptProxyProtocol": false,
-    "path": "/${ws_port}/${ws_path}",
-    "host": "${domain}",
-    "headers": {}
-  }
-}',
-    'inbound-${ws_port}',
-    '{"enabled":false,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
-);
-
-INSERT INTO "inbounds"
-    ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing")
-VALUES (
-    '1','0','0','0','${emoji_flag} xhttp','0','0','/dev/shm/uds2023.sock,0666','0','vless',
-    '{
-  "clients": [],
-  "decryption": "none",
-  "fallbacks": []
-}',
-    '{
-  "network": "xhttp",
-  "security": "none",
-  "xhttpSettings": {
-    "path": "/${xhttp_path}",
-    "host": "${domain}",
-    "headers": {},
-    "scMaxBufferedPosts": 30,
-    "scMaxEachPostBytes": "1000000",
-    "noSSEHeader": false,
-    "xPaddingBytes": "100-1000",
-    "mode": "packet-up"
-  },
-  "sockopt": {
-    "acceptProxyProtocol": false,
-    "tcpFastOpen": true,
-    "mark": 0,
-    "tproxy": "off",
-    "tcpMptcp": true,
-    "tcpNoDelay": true,
-    "domainStrategy": "UseIP",
-    "tcpMaxSeg": 1440,
-    "dialerProxy": "",
-    "tcpKeepAliveInterval": 0,
-    "tcpKeepAliveIdle": 300,
-    "tcpUserTimeout": 10000,
-    "tcpcongestion": "bbr",
-    "V6Only": false,
-    "tcpWindowClamp": 600,
-    "interface": ""
-  }
-}',
-    'inbound-/dev/shm/uds2023.sock,0666:0|',
-    '{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
-);
-
-INSERT INTO "inbounds"
-    ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing")
-VALUES (
-    '1','0','0','0','${emoji_flag} trojan-grpc','1','0','','${trojan_port}','trojan',
-    '{
-  "clients": [],
-  "fallbacks": []
-}',
-    '{
-  "network": "grpc",
-  "security": "none",
-  "grpcSettings": {
-    "serviceName": "/${trojan_port}/${trojan_path}",
-    "authority": "${domain}",
-    "multiMode": false
-  }
-}',
-    'inbound-${trojan_port}',
-    '{"enabled":false,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
-);
-
--- Hosts supersede the legacy externalProxy arrays: one host per inbound,
--- rendered as the share-link endpoint at subscription time.
--- REALITY keeps its own TLS params (security=same); the rest front through
--- nginx at :443 with TLS.
-INSERT INTO "hosts" ("inbound_id",${gid_col}"sort_order","remark","address","port","security","fingerprint","alpn")
-VALUES
-    ((SELECT id FROM inbounds WHERE tag='inbound-8443'),           ${gid_reality} 0, 'reality', '${domain}', 443, 'same', '',        '[]'),
-    ((SELECT id FROM inbounds WHERE tag='inbound-${ws_port}'),     ${gid_ws}      0, 'ws',      '${domain}', 443, 'tls',  'firefox', '["h2","http/1.1"]'),
-    ((SELECT id FROM inbounds WHERE tag='inbound-/dev/shm/uds2023.sock,0666:0|'), ${gid_xhttp} 0, 'xhttp', '${domain}', 443, 'tls', 'firefox', '["h2","http/1.1"]'),
-    ((SELECT id FROM inbounds WHERE tag='inbound-${trojan_port}'), ${gid_trojan}  0, 'trojan',  '${domain}', 443, 'tls',  'firefox', '["h2","http/1.1"]');
-EOF
-
-    /usr/local/x-ui/x-ui setting \
-        -username  "${config_username}" \
-        -password  "${config_password}" \
-        -port      "${panel_port}"      \
-        -webBasePath "${panel_path}"
-
-    /usr/local/x-ui/x-ui cert \
-        -webCert    "/root/cert/${domain}/fullchain.pem" \
-        -webCertKey "/root/cert/${domain}/privkey.pem"
-
-    x-ui start
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# INSTALL FAKE SITE
-# ─────────────────────────────────────────────────────────────────────────────
-install_clash_sub() {
-    local clash_dir="/var/www/subpage"
-    mkdir -p "${clash_dir}"
-    if curl -fsSL "${GITHUB_RAW}/assets/clash/clash.yaml" -o "${clash_dir}/clash.yaml.tpl"; then
-        # Substitute domain and sub_path; leave ${EMAIL} for mtr-backend to fill per-request
-        sed -i "s|\${DOMAIN}|${domain}|g"     "${clash_dir}/clash.yaml.tpl"
-        sed -i "s|\${SUB_PATH}|${sub_path}|g" "${clash_dir}/clash.yaml.tpl"
-        chown -R www-data:www-data "${clash_dir}" 2>/dev/null || true
-        chmod 644 "${clash_dir}/clash.yaml.tpl"
-        msg_ok "Clash subscription template installed."
-    else
-        msg_err "Failed to download clash.yaml from GitHub."
-    fi
-}
-
-install_fake_site() {
-    local idx=$(( (RANDOM % FAKE_SITE_COUNT) + 1 ))
-    local site_id
-    site_id=$(printf "site-%02d" "$idx")
-    local url="${GITHUB_RAW}/assets/fake-sites/${site_id}/index.html"
-
-    mkdir -p /var/www/html
-    if curl -fsSL "$url" -o /var/www/html/index.html; then
-        chown -R www-data:www-data /var/www/html 2>/dev/null || true
-        chmod 644 /var/www/html/index.html
-        msg_ok "Fake cover site '${site_id}' installed."
-    else
-        msg_err "Failed to download fake site ${site_id} from GitHub."
-    fi
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# INSTALL NETWORK DIAGNOSTICS PAGE
-# ─────────────────────────────────────────────────────────────────────────────
-install_diagnostics() {
-    local diag_webroot="/var/www/diagnostics"
-    local backend_script="/usr/local/lib/3x-ui-pro/mtr-backend.py"
-
-    # Diagnostics HTML page
-    mkdir -p "${diag_webroot}"
-    curl -fsSL "${GITHUB_RAW}/assets/diagnostics/index.html" -o "${diag_webroot}/index.html"
-    sed -i \
-        -e "s|__DIAG_PATH__|${diag_path}|g" \
-        -e "s|__SERVER_DOMAIN__|${domain}|g" \
-        -e "s|__SERVER_IP__|${IP4}|g" \
-        "${diag_webroot}/index.html"
-
-    # LibreSpeed engine (speed test frontend, LGPL — github.com/librespeed/speedtest)
-    curl -fsSL "${GITHUB_RAW}/assets/diagnostics/librespeed/speedtest.js" \
-        -o "${diag_webroot}/speedtest.js"
-    curl -fsSL "${GITHUB_RAW}/assets/diagnostics/librespeed/speedtest_worker.js" \
-        -o "${diag_webroot}/speedtest_worker.js"
-
-    # Test download files
-    local testfiles="${diag_webroot}/testfiles"
-    mkdir -p "${testfiles}"
-    [[ -f "${testfiles}/test-15k.bin"  ]] || dd if=/dev/zero bs=1024    count=15   of="${testfiles}/test-15k.bin"  status=none
-    [[ -f "${testfiles}/test-17k.bin"  ]] || dd if=/dev/zero bs=1024    count=17   of="${testfiles}/test-17k.bin"  status=none
-    [[ -f "${testfiles}/test-100m.bin" ]] || dd if=/dev/zero bs=1048576 count=100  of="${testfiles}/test-100m.bin" status=none
-    [[ -f "${testfiles}/test-1g.bin"   ]] || dd if=/dev/zero bs=1048576 count=1024 of="${testfiles}/test-1g.bin"   status=none
-    rm -f "${testfiles}/test-512m.bin"   # only used by the old single-stream speed test
-    chown -R www-data:www-data "${diag_webroot}" 2>/dev/null || true
-
-    # MTR backend Python script
-    mkdir -p "$(dirname "${backend_script}")"
-    curl -fsSL "${GITHUB_RAW}/assets/diagnostics/mtr-backend.py" -o "${backend_script}"
-    chmod 755 "${backend_script}"
-
-    # Grant mtr raw socket capability (runs as restricted user, no root needed)
-    # mtr-packet is the helper that actually opens the raw socket
-    command -v setcap &>/dev/null && setcap cap_net_raw+ep "$(command -v mtr)"        2>/dev/null || true
-    command -v setcap &>/dev/null && setcap cap_net_raw+ep "$(command -v mtr-packet)" 2>/dev/null || true
-
-    # Dedicated system user for mtr-backend
-    id mtr-backend &>/dev/null || \
-        useradd --system --no-create-home --shell /usr/sbin/nologin mtr-backend
-
-    # Systemd service for mtr-backend
-    cat > /etc/systemd/system/mtr-backend.service <<EOF
-[Unit]
-Description=3x-ui-pro MTR diagnostics backend
-After=network.target
-
-[Service]
-Type=simple
-User=mtr-backend
-Group=mtr-backend
-ExecStart=/usr/bin/python3 ${backend_script} --port ${mtr_backend_port}
-Restart=on-failure
-RestartSec=5s
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
-RestrictNamespaces=yes
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-RemoveIPC=yes
-# mtr-packet opens raw ICMP sockets. NoNewPrivileges=yes strips the file
-# capability off the mtr binary, so grant CAP_NET_RAW the systemd-native way
-# (ambient caps survive NoNewPrivileges). Empty here = mtr fails with
-# "Failure to open IPv4 sockets: Permission denied".
-AmbientCapabilities=CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_RAW
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=mtr-backend
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable mtr-backend
-    systemctl restart mtr-backend
-
-    msg_ok "Network diagnostics installed at https://${domain}/${panel_path}/diag (panel login required)"
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SYSTEM TUNING (BBR + kernel params)
-# ─────────────────────────────────────────────────────────────────────────────
-tune_system() {
-    local params=(
-        "net.core.default_qdisc=fq"
-        "net.ipv4.tcp_congestion_control=bbr"
-        "fs.file-max=2097152"
-        "net.ipv4.tcp_timestamps=1"
-        "net.ipv4.tcp_sack=1"
-        "net.ipv4.tcp_window_scaling=1"
-        "net.core.rmem_max=16777216"
-        "net.core.wmem_max=16777216"
-        "net.ipv4.tcp_rmem=4096 87380 16777216"
-        "net.ipv4.tcp_wmem=4096 65536 16777216"
-    )
-    for p in "${params[@]}"; do
-        grep -qxF "$p" /etc/sysctl.conf || echo "$p" >> /etc/sysctl.conf
-    done
-    sysctl -p
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CRON JOBS
-# ─────────────────────────────────────────────────────────────────────────────
-setup_cron() {
-    crontab -l 2>/dev/null | grep -v "certbot\|x-ui\|cloudflareips" | crontab -
-    (crontab -l 2>/dev/null; echo '@daily   x-ui restart > /dev/null 2>&1 && nginx -s reload')    | crontab -
-    # Certs were issued with --standalone: renewal needs port 80 free,
-    # so stop nginx for the few seconds certbot runs
-    (crontab -l 2>/dev/null; echo '@monthly certbot renew --non-interactive --pre-hook "systemctl stop nginx" --post-hook "systemctl start nginx" > /dev/null 2>&1') | crontab -
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FIREWALL
-# ─────────────────────────────────────────────────────────────────────────────
-setup_firewall() {
-    ufw disable
-    ufw allow 22/tcp
-    ufw allow 80/tcp
-    ufw allow 443/tcp
-    ufw allow 443/udp
-    ufw --force enable
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SHOW RESULTS
-# ─────────────────────────────────────────────────────────────────────────────
-show_results() {
-    clear
-    if systemctl is-active --quiet x-ui; then
-        printf '0\n' | x-ui | grep --color=never -i ':'
-        msg_inf "────────────────────────────────────────────────────────────────────────────────"
-        msg_inf "X-UI Secure Panel: https://${domain}/${panel_path}/\n"
-        echo -e "Username:  ${config_username}\n"
-        echo -e "Password:  ${config_password}\n"
-        msg_inf "────────────────────────────────────────────────────────────────────────────────"
-        msg_inf "Network Diagnostics (panel login required): https://${domain}/${panel_path}/diag\n"
-        msg_inf "────────────────────────────────────────────────────────────────────────────────"
-        msg_inf "Please save this screen!"
-    else
-        nginx -t
-        printf '0\n' | x-ui | grep --color=never -i ':'
-        msg_err "x-ui or nginx check failed. Try on a clean Linux install."
-    fi
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-main() {
-    validate_domains
-    clean_previous_install
-    install_packages
-    get_server_ip
-    get_ssl_certs
-
-    if systemctl is-active --quiet x-ui; then
-        x-ui restart
-    else
-        install_panel
-    fi
-
-    configure_nginx
-    configure_xui_db
-    install_clash_sub
-    install_fake_site
-    install_diagnostics
-    tune_system
-    setup_cron
-    setup_firewall
-
-    if ! systemctl is-enabled --quiet x-ui; then
-        systemctl daemon-reload && systemctl enable x-ui.service
-    fi
-    x-ui restart
-
-    show_results
-}
-
-main
+    echo "Installing ${REPO_NAME} ${tag_version}
