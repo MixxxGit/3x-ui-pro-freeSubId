@@ -51,7 +51,7 @@ check_cpu
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 XUIDB="/etc/x-ui/x-ui.db"
-GITHUB_RAW="https://gh-proxy.com/raw.githubusercontent.com/MixxxGit/3x-ui-pro-freeSubId/main"
+GITHUB_RAW="https://raw.githubusercontent.com/MixxxGit/3x-ui-pro-freeSubId/main"
 FAKE_SITE_COUNT=50
 
 # ─── Default argument values ─────────────────────────────────────────────────
@@ -728,8 +728,8 @@ install_panel() {
     local REPO_OWNER="MixxxGit"
     local REPO_NAME="3x-ui"
 
-    local REPO_URL="https://gh-proxy.com/github.com/${REPO_OWNER}/${REPO_NAME}"
-    local API_URL="https://gh-proxy.com/api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
+    local REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
+    local API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
     
     apt-get update && apt-get install -y -q wget curl tar tzdata
 
