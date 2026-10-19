@@ -851,8 +851,27 @@ configure_xui_db() {
     shor=($(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) \
            $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8))
 
+    # settings has no UNIQUE index on key, and the panel seeds its own subPath /
+    # subJsonPath / subClashPath rows when it first boots (install_panel starts it
+    # above). A bare INSERT therefore appends a SECOND row per key instead of
+    # replacing the seeded one. The panel reads with GORM First() (lowest id) and
+    # the sub server mounts that path, so a stale lower-id row silently wins and
+    # every subscription URL 404s. Delete the keys we are about to write, and
+    # collapse any duplicate rows an earlier run already created.
     sqlite3 $XUIDB <<EOF
-DELETE FROM "settings" WHERE "key" IN ("webCertFile","webKeyFile");
+DELETE FROM "settings" WHERE "key" IN (
+    "subPort","subPath","subURI","subJsonPath","subJsonURI",
+    "subClashEnable","subEnableRouting","subEnable",
+    "webListen","webDomain","webCertFile","webKeyFile",
+    "sessionMaxAge","pageSize","expireDiff","trafficDiff","remarkModel",
+    "tgBotEnable","tgBotToken","tgBotProxy","tgBotAPIServer","tgBotChatId",
+    "tgRunTime","tgBotBackup","tgBotLoginNotify","tgCpu","tgLang",
+    "timeLocation","secretEnable","subDomain","subCertFile","subKeyFile",
+    "subUpdates","subEncrypt","subShowInfo","subJsonFragment","subJsonNoises",
+    "subJsonMux","subJsonRules","datepicker"
+);
+DELETE FROM "settings"
+ WHERE "id" NOT IN (SELECT MIN("id") FROM "settings" GROUP BY "key");
 
 INSERT INTO "settings" ("key","value") VALUES ("subPort",             '${sub_port}');
 INSERT INTO "settings" ("key","value") VALUES ("subPath",             '/${sub_path}/');
